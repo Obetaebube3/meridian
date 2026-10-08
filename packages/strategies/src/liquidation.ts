@@ -1,130 +1,225 @@
-import { AssetSymbol, FixedPointDecimal, PriceFeed, SimulationTimestamp, STROOPS_PER_UNIT } from "./types";
+import { Decimal } from "./decimal";
+import { LiquidationParameterModel } from "./models/liquidation-parameter";
+import { FixedPointDecimal } from "./types";
+import type { AssetSymbol, PriceFeed, SimulationTimestamp } from "./types";
 
-export interface Position {
-  id: string;
-  collateralAsset: AssetSymbol;
-  collateralAmount: FixedPointDecimal;
-  debtAsset: AssetSymbol;
-  debtAmount: FixedPointDecimal;
+/**
+ * A leveraged position: collateral held against a debt denominated in a second
+ * asset. Both fields are amounts of their own asset, not values; values are
+ * derived from the price feed at the timestamp being evaluated.
+ */
+export interface LeveragedPosition {
+  readonly id: string;
+  readonly collateralAsset: AssetSymbol;
+  readonly collateralAmount: FixedPointDecimal;
+  readonly debtAsset: AssetSymbol;
+  readonly debtAmount: FixedPointDecimal;
 }
 
-export interface LiquidationParameters {
-  threshold: FixedPointDecimal;
-  penalty: FixedPointDecimal;
-}
-
+/**
+ * Amounts are not all in the same unit. `debtCleared` is denominated in the
+ * position's debt asset, `collateralSeized` in its collateral asset, and
+ * `realizedLoss` in the quote currency the prices are quoted in, which is what
+ * lets losses on positions with different debt assets be summed.
+ */
 export interface LiquidationEvent {
-  positionId: string;
-  timestamp: SimulationTimestamp;
-  healthFactor: FixedPointDecimal;
-  debtCleared: FixedPointDecimal;
-  collateralSeized: FixedPointDecimal;
-  realizedLoss: FixedPointDecimal;
+  readonly positionId: string;
+  readonly timestamp: SimulationTimestamp;
+  /** The factor that triggered the liquidation, rounded to 7 decimal places. */
+  readonly healthFactor: FixedPointDecimal;
+  readonly debtCleared: FixedPointDecimal;
+  readonly collateralSeized: FixedPointDecimal;
+  /** Debt the seized collateral could not cover, written off with the position. */
+  readonly realizedLoss: FixedPointDecimal;
 }
 
-export interface PortfolioState {
-  positions: Map<string, Position>;
-  realizedLosses: FixedPointDecimal;
-}
-
+/** Receives each liquidation so a run can count them. */
 export interface MetricsCollector {
   emit(event: LiquidationEvent): void;
 }
 
-function multiply(a: FixedPointDecimal, b: FixedPointDecimal): FixedPointDecimal {
-  const result = (a.toStroops() * b.toStroops()) / STROOPS_PER_UNIT;
-  return FixedPointDecimal.fromStroops(result);
+/** Open positions and the debt written off against them so far. */
+export interface LiquidationBook {
+  readonly positions: ReadonlyMap<string, LeveragedPosition>;
+  readonly realizedLosses: FixedPointDecimal;
 }
 
-function divide(a: FixedPointDecimal, b: FixedPointDecimal): FixedPointDecimal {
-  if (b.toStroops() === 0n) throw new Error("Divide by zero");
-  const result = (a.toStroops() * STROOPS_PER_UNIT) / b.toStroops();
-  return FixedPointDecimal.fromStroops(result);
+export interface LiquidationTickResult {
+  readonly book: LiquidationBook;
+  readonly liquidations: readonly LiquidationEvent[];
 }
 
-function add(a: FixedPointDecimal, b: FixedPointDecimal): FixedPointDecimal {
-  return FixedPointDecimal.fromStroops(a.toStroops() + b.toStroops());
-}
-
-function subtract(a: FixedPointDecimal, b: FixedPointDecimal): FixedPointDecimal {
-  return FixedPointDecimal.fromStroops(a.toStroops() - b.toStroops());
-}
-
+/**
+ * Liquidates positions whose health factor falls strictly below 1.0, which is
+ * the rule `LiquidationParameterModel.isLiquidatable` states. A position
+ * sitting exactly on 1.0 is safe, and a position carrying no debt has no health
+ * factor and is never liquidated.
+ *
+ * A liquidation seizes collateral worth the debt plus the model's penalty,
+ * capped at the collateral actually held, and writes off whatever debt that
+ * leaves uncovered. Positions are immutable, so a tick returns a new book and
+ * reports the liquidations it applied.
+ *
+ * Values are computed in `Decimal`, which is what the model takes, so they round
+ * half-up rather than truncating the way `FixedPointDecimal` does.
+ */
 export class LiquidationEngine {
+  readonly #priceFeed: PriceFeed;
+  readonly #model: LiquidationParameterModel;
+  readonly #metrics: MetricsCollector;
+
   constructor(
-    private priceFeed: PriceFeed,
-    private params: LiquidationParameters,
-    private metrics: MetricsCollector
-  ) {}
-
-  computeHealthFactor(position: Position, timestamp: SimulationTimestamp): FixedPointDecimal {
-    if (position.debtAmount.toStroops() === 0n) {
-      return FixedPointDecimal.fromString("999999999");
-    }
-
-    const collateralPrice = this.priceFeed.getSpotPrice(position.collateralAsset, timestamp);
-    const debtPrice = this.priceFeed.getSpotPrice(position.debtAsset, timestamp);
-
-    const collateralValue = multiply(position.collateralAmount, collateralPrice);
-    const debtValue = multiply(position.debtAmount, debtPrice);
-
-    return divide(collateralValue, debtValue);
+    priceFeed: PriceFeed,
+    model: LiquidationParameterModel,
+    metrics: MetricsCollector
+  ) {
+    this.#priceFeed = priceFeed;
+    this.#model = model;
+    this.#metrics = metrics;
   }
 
-  evaluatePosition(position: Position, timestamp: SimulationTimestamp, portfolio: PortfolioState): void {
-    if (position.debtAmount.toStroops() === 0n) return;
+  /**
+   * Health factor from the model, or `undefined` when the position carries no
+   * debt and so can never be liquidated.
+   */
+  computeHealthFactor(
+    position: LeveragedPosition,
+    timestamp: SimulationTimestamp
+  ): FixedPointDecimal | undefined {
+    const healthFactor = this.#model.computeHealthFactor(
+      this.#collateralValue(position, timestamp),
+      this.#debtValue(position, timestamp)
+    );
 
-    const hf = this.computeHealthFactor(position, timestamp);
-
-    // Liquidate if health factor is strictly less than threshold
-    // Behavior exactly at boundary: no liquidation if hf.compareTo(this.params.threshold) === 0
-    if (hf.compareTo(this.params.threshold) < 0) {
-      this.liquidate(position, timestamp, portfolio, hf);
-    }
+    return healthFactor === undefined
+      ? undefined
+      : LiquidationEngine.#toFixedPoint(healthFactor);
   }
 
-  private liquidate(position: Position, timestamp: SimulationTimestamp, portfolio: PortfolioState, hf: FixedPointDecimal): void {
-    const collateralPrice = this.priceFeed.getSpotPrice(position.collateralAsset, timestamp);
-    const debtPrice = this.priceFeed.getSpotPrice(position.debtAsset, timestamp);
+  processTick(
+    book: LiquidationBook,
+    timestamp: SimulationTimestamp
+  ): LiquidationTickResult {
+    const positions = new Map(book.positions);
+    const liquidations: LiquidationEvent[] = [];
+    let realizedLosses = LiquidationEngine.#toDecimal(book.realizedLosses);
 
-    const debtValue = multiply(position.debtAmount, debtPrice);
-    
-    const one = FixedPointDecimal.fromString("1");
-    const penaltyMultiplier = add(one, this.params.penalty);
-    const requiredCollateralValue = multiply(debtValue, penaltyMultiplier);
-    
-    let seizedCollateralAmount = divide(requiredCollateralValue, collateralPrice);
-    let realizedLoss = FixedPointDecimal.fromString("0");
+    for (const [key, position] of book.positions) {
+      const event = this.#liquidate(position, timestamp);
+      if (event === undefined) continue;
 
-    if (seizedCollateralAmount.compareTo(position.collateralAmount) > 0) {
-      seizedCollateralAmount = position.collateralAmount;
-      const collateralValueSeized = multiply(seizedCollateralAmount, collateralPrice);
-      
-      if (collateralValueSeized.compareTo(debtValue) < 0) {
-        realizedLoss = subtract(debtValue, collateralValueSeized);
-      }
+      liquidations.push(event);
+      realizedLosses = realizedLosses.add(
+        LiquidationEngine.#toDecimal(event.realizedLoss)
+      );
+      positions.set(key, {
+        ...position,
+        collateralAmount: position.collateralAmount.sub(event.collateralSeized),
+        debtAmount: FixedPointDecimal.fromStroops(0n),
+      });
     }
 
-    const debtCleared = position.debtAmount;
+    // Emitted only after the whole tick has been evaluated, so a tick that
+    // throws cannot leave the collector ahead of the state the caller receives.
+    for (const event of liquidations) {
+      this.#metrics.emit(event);
+    }
 
-    this.metrics.emit({
+    return {
+      book: {
+        positions,
+        realizedLosses: LiquidationEngine.#toFixedPoint(realizedLosses),
+      },
+      liquidations,
+    };
+  }
+
+  #liquidate(
+    position: LeveragedPosition,
+    timestamp: SimulationTimestamp
+  ): LiquidationEvent | undefined {
+    const collateralPrice = this.#price(position.collateralAsset, timestamp);
+    const collateralValue = LiquidationEngine.#toDecimal(
+      position.collateralAmount
+    ).mul(collateralPrice);
+    const debtValue = this.#debtValue(position, timestamp);
+
+    const healthFactor = this.#model.computeHealthFactor(
+      collateralValue,
+      debtValue
+    );
+    if (healthFactor === undefined || !healthFactor.lt(Decimal.one())) {
+      return undefined;
+    }
+
+    const requiredValue = debtValue.mul(
+      Decimal.one().add(this.#model.liquidationPenalty)
+    );
+    const requiredAmount = requiredValue.div(collateralPrice);
+    const collateralHeld = LiquidationEngine.#toDecimal(
+      position.collateralAmount
+    );
+    // Capped means the collateral could not raise the debt and the penalty, so
+    // the position is the only case where debt can be left uncovered. Without
+    // the cap the seizure was sized to cover both, and any remaining shortfall
+    // is rounding on the seizure rather than debt nobody paid.
+    const capped = requiredAmount.gte(collateralHeld);
+    const collateralSeized = capped ? collateralHeld : requiredAmount;
+    const seizedValue = collateralSeized.mul(collateralPrice);
+    const realizedLoss =
+      capped && debtValue.gt(seizedValue)
+        ? debtValue.sub(seizedValue)
+        : Decimal.zero();
+
+    return {
       positionId: position.id,
       timestamp,
-      healthFactor: hf,
-      debtCleared,
-      collateralSeized: seizedCollateralAmount,
-      realizedLoss
-    });
-
-    position.debtAmount = FixedPointDecimal.fromString("0");
-    position.collateralAmount = subtract(position.collateralAmount, seizedCollateralAmount);
-    
-    portfolio.realizedLosses = add(portfolio.realizedLosses, realizedLoss);
+      healthFactor: LiquidationEngine.#toFixedPoint(healthFactor),
+      debtCleared: position.debtAmount,
+      collateralSeized: LiquidationEngine.#toFixedPoint(collateralSeized),
+      realizedLoss: LiquidationEngine.#toFixedPoint(realizedLoss),
+    };
   }
 
-  processTick(portfolio: PortfolioState, timestamp: SimulationTimestamp): void {
-    for (const position of portfolio.positions.values()) {
-      this.evaluatePosition(position, timestamp, portfolio);
+  #collateralValue(
+    position: LeveragedPosition,
+    timestamp: SimulationTimestamp
+  ): Decimal {
+    return LiquidationEngine.#toDecimal(position.collateralAmount).mul(
+      this.#price(position.collateralAsset, timestamp)
+    );
+  }
+
+  #debtValue(
+    position: LeveragedPosition,
+    timestamp: SimulationTimestamp
+  ): Decimal {
+    return LiquidationEngine.#toDecimal(position.debtAmount).mul(
+      this.#price(position.debtAsset, timestamp)
+    );
+  }
+
+  /**
+   * A price that is not strictly positive is not a usable price for a stable
+   * asset, so it is rejected. Letting a zero through would flatten the value it
+   * multiplies, which on the debt side reads as a position carrying no debt and
+   * quietly exempts it from liquidation.
+   */
+  #price(asset: AssetSymbol, timestamp: SimulationTimestamp): Decimal {
+    const price = LiquidationEngine.#toDecimal(
+      this.#priceFeed.getSpotPrice(asset, timestamp)
+    );
+    if (!price.isPositive()) {
+      throw new RangeError(`Price for ${asset} must be greater than zero`);
     }
+    return price;
+  }
+
+  static #toDecimal(value: FixedPointDecimal): Decimal {
+    return Decimal.fromStroops(value.toStroops());
+  }
+
+  static #toFixedPoint(value: Decimal): FixedPointDecimal {
+    return FixedPointDecimal.fromStroops(value.toStroops());
   }
 }
